@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { normalizeInvitationEmail } from "@/lib/workspace-invitations";
+import { isFeastMode } from "@/lib/feast/config";
 
 export async function POST(request: NextRequest) {
+  if (isFeastMode()) return NextResponse.json({ error: "Staff access is managed in Feast Admin." }, { status: 403 });
   const session = await auth();
   if (!session?.user?.id || !session.user.email) {
     return NextResponse.json(

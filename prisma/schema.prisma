@@ -212,12 +212,18 @@ model DmLog {
   status        DmStatus @default(PENDING)
   attempts      Int      @default(0)
   dmSentAt      DateTime?
+  dmDeliveryState DeliveryState @default(PENDING)
+  dmClaimedAt   DateTime?
+  dmMessageId   String?
   errorMessage  String?
 
   // The public comment reply is delivered independently of the DM, so its
   // outcome is tracked separately. publicReplySentAt makes it idempotent across
   // retries; a DM failure never blocks or re-posts the public reply.
   publicReplySentAt DateTime?
+  publicReplyDeliveryState DeliveryState @default(PENDING)
+  publicReplyClaimedAt DateTime?
+  publicReplyMessageId String?
   publicReplyError  String?
 
   createdAt DateTime @default(now())
@@ -300,6 +306,9 @@ model WebhookEvent {
   errorMessage String?
   createdAt   DateTime      @default(now())
   processedAt DateTime?
+  payloadHash String? @unique
+  replayAttempts Int @default(0)
+  replayAfter DateTime @default(now())
 
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
@@ -363,4 +372,24 @@ enum OperationalEventLevel {
   INFO
   WARNING
   ERROR
+}
+
+// Durable dispatch journal. Redis can be rebuilt from unfinished rows.
+model QueueOutbox {
+  id String @id
+  jobName String
+  payload Json
+  availableAt DateTime @default(now())
+  nextDispatchAt DateTime @default(now())
+  completedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([completedAt, nextDispatchAt])
+}
+
+enum DeliveryState {
+  PENDING
+  SENDING
+  SENT
+  REJECTED
+  UNKNOWN
 }

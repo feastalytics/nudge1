@@ -1,52 +1,53 @@
-import { NextResponse, type NextRequest } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
+import { getFeastConfig, hasAllowedMutationOrigin, isFeastMode } from "@/lib/feast/config";
 
-const PROTECTED_PREFIXES = ["/dashboard", "/automations", "/logs", "/settings"];
+const SEPARATELY_AUTHENTICATED = new Set([
+  "/api/feast/session",
+  "/api/webhook",
+  "/api/cron/refresh-tokens",
+  "/api/cron/attach-next-reel",
+]);
 
-function hasSessionCookie(request: NextRequest): boolean {
-  return (
-    request.cookies.has("authjs.session-token") ||
-    request.cookies.has("__Secure-authjs.session-token") ||
-    request.cookies.has("next-auth.session-token") ||
-    request.cookies.has("__Secure-next-auth.session-token")
-  );
-}
-
-export function proxy(request: NextRequest) {
+function genericProxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
-  const isProtected = PROTECTED_PREFIXES.some(
-    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)
-  );
-  const isLogin = pathname === "/login";
-  const isMarketingHome = pathname === "/";
-  const isAuthenticated = hasSessionCookie(request);
-
-  if (isProtected && !isAuthenticated) {
+  const protectedPrefixes = ["/dashboard", "/automations", "/logs", "/settings"];
+  const protectedPath = protectedPrefixes.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`));
+  const authenticated = ["authjs.session-token", "__Secure-authjs.session-token", "next-auth.session-token", "__Secure-next-auth.session-token"].some((name) => request.cookies.has(name));
+  if (protectedPath && !authenticated) {
     const loginUrl = new URL("/login", request.url);
     loginUrl.searchParams.set("callbackUrl", pathname);
     return NextResponse.redirect(loginUrl);
   }
-
-  if (isLogin && isAuthenticated) {
+  if ((pathname === "/login" || pathname === "/") && authenticated) {
     return NextResponse.redirect(new URL("/campaigns", request.url));
   }
-
-  // A signed-in visitor lands straight in the app instead of the marketing
-  // page — this is a self-hosted instance for one person/team, not a public
-  // site with strangers landing on it while logged in.
-  if (isMarketingHome && isAuthenticated) {
-    return NextResponse.redirect(new URL("/campaigns", request.url));
-  }
-
   return NextResponse.next();
 }
 
-export const config = {
-  matcher: [
-    "/",
-    "/dashboard/:path*",
-    "/automations/:path*",
-    "/logs/:path*",
-    "/settings/:path*",
-    "/login",
-  ],
-};
+export function proxy(request: NextRequest) {
+  if (!isFeastMode()) return genericProxy(request);
+  try {
+    const config = getFeastConfig();
+    const path = request.nextUrl.pathname;
+    // Shared reports bypass dashboard authentication in upstream Nudge.
+    // Public sharing is unavailable in the staff-only pilot.
+    if (path === "/reports" || path.startsWith("/reports/")) {
+      return new NextResponse(null, { status: 404, headers: { "Cache-Control": "no-store" } });
+    }
+    if (!["GET", "HEAD", "OPTIONS"].includes(request.method) &&
+        !SEPARATELY_AUTHENTICATED.has(path) &&
+        !hasAllowedMutationOrigin(request, config.serviceOrigin)) {
+      return NextResponse.json({ error: "Invalid request origin" }, { status: 403 });
+    }
+    const response = path === "/" || path.startsWith("/invite/")
+      ? NextResponse.redirect(new URL("/login", config.serviceOrigin))
+      : NextResponse.next();
+    response.headers.set("Content-Security-Policy", `frame-ancestors 'self' ${config.adminOrigin}`);
+    response.headers.set("Referrer-Policy", "no-referrer");
+    return response;
+  } catch {
+    return NextResponse.json({ error: "Feast access is not configured" }, { status: 503 });
+  }
+}
+
+export const config = { matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"] };

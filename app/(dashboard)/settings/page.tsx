@@ -24,6 +24,7 @@ interface SettingsData {
 const GMT_OFFSETS: number[] = Array.from({ length: 27 }, (_, i) => (i - 12) * 60);
 
 interface WorkspaceMembersData {
+  managedByFeast?: boolean;
   currentUserRole: "OWNER" | "ADMIN" | "MEMBER";
   members: Array<{
     id: string;
@@ -243,8 +244,8 @@ export default function SettingsPage() {
   }
 
   const canManageMembers =
-    membersData?.currentUserRole === "OWNER" ||
-    membersData?.currentUserRole === "ADMIN";
+    !membersData?.managedByFeast && (membersData?.currentUserRole === "OWNER" ||
+    membersData?.currentUserRole === "ADMIN");
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -568,6 +569,9 @@ export default function SettingsPage() {
                   </div>
                 ) : null}
 
+                {membersData?.managedByFeast && (
+                  <p className="mt-6 text-sm text-muted">Staff access is managed in Feast Admin.</p>
+                )}
                 {canManageMembers && (
                   <form
                     onSubmit={inviteMember}

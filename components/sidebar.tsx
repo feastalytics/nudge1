@@ -209,6 +209,16 @@ export default function Sidebar({ expanded, onToggle }: SidebarProps) {
           })}
 
           <a
+            href="/api/feast/source"
+            target="_blank"
+            rel="noreferrer"
+            title="Source code for this deployment"
+            className="flex rounded-lg px-2 py-2 text-xs text-muted hover:text-foreground hover:bg-surface-hover"
+          >
+            Source code
+          </a>
+
+          <a
             href={BMC_URL}
             target="_blank"
             rel="noreferrer"

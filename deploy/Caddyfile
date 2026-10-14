@@ -1,0 +1,15 @@
+{
+  admin off
+}
+
+{$NUDGE_HOSTNAME} {
+  encode zstd gzip
+  # No access log: OAuth codes and short-lived launch tokens must not be logged.
+  # The application sets frame-ancestors to the exact Feast admin origin.
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+  }
+  reverse_proxy web:3000
+}

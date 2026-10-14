@@ -1,0 +1,15 @@
+{
+  "hostname": "nudge.example.com",
+  "feastAdminOrigin": "https://feast-admin.netlify.app",
+  "sourceUrl": "https://github.com/REPLACE/REPLACE/archive/EXACT_COMMIT.tar.gz",
+  "ownedInstagramIds": ["REPLACE_WITH_FEAST_PROFESSIONAL_ACCOUNT_ID"],
+  "sendEnabled": false,
+  "images": {
+    "web": "ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/REPOSITORY@sha256:REPLACE",
+    "worker": "ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/REPOSITORY@sha256:REPLACE",
+    "migrate": "ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/REPOSITORY@sha256:REPLACE",
+    "postgres": "postgres:16-bookworm@sha256:REPLACE",
+    "redis": "redis:7.4-alpine@sha256:REPLACE",
+    "caddy": "caddy:2-alpine@sha256:REPLACE"
+  }
+}

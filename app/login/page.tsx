@@ -1,5 +1,6 @@
 import { signIn } from "@/lib/auth";
 import { getCampaignTemplate } from "@/lib/templates/campaign-templates";
+import { getFeastConfig, isFeastMode } from "@/lib/feast/config";
 
 export const metadata = {
   title: "Login - Nudge1",
@@ -15,6 +16,19 @@ export default async function LoginPage({
     template?: string;
   }>;
 }) {
+  if (isFeastMode()) {
+    const { adminOrigin } = getFeastConfig();
+    return (
+      <main className="min-h-screen flex items-center justify-center px-6">
+        <div className="panel max-w-md rounded p-8 text-center">
+          <h1 className="text-2xl font-semibold">Nudge1</h1>
+          <p className="mt-4 text-sm text-muted">Sign in through Feast Admin. Staff sessions expire after one hour.</p>
+          <a href={`${adminOrigin}/admin/nudge`} target="_top" className="mt-6 inline-block rounded bg-accent px-5 py-3 text-white">Open Feast Admin</a>
+          <a href="/api/feast/source" target="_blank" rel="noreferrer" className="mt-4 block text-sm text-muted">Source code for this deployment</a>
+        </div>
+      </main>
+    );
+  }
   const params = await searchParams;
   const checkEmail = params.checkEmail === "1";
   const selectedTemplate = getCampaignTemplate(params.template);

@@ -26,7 +26,10 @@ let redis: Redis | null = null;
 function getRedis(): Redis {
   if (!redis) {
     redis = new Redis(process.env.REDIS_URL!, {
-      maxRetriesPerRequest: null, // required by BullMQ
+      maxRetriesPerRequest: 1,
+      commandTimeout: 5000,
+      connectTimeout: 5000,
+      enableOfflineQueue: false,
     });
   }
   return redis;

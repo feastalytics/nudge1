@@ -1,3 +1,5 @@
+import { cronAccountFilter, isAuthorizedCronRequest, isCronAccountAllowed } from "@/lib/feast/cron";
+import { FEAST_WORKSPACE_ID, isFeastMode } from "@/lib/feast/config";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { decryptToken, encryptToken } from "@/lib/meta/oauth";
@@ -7,10 +9,7 @@ import { checkAndSendAlerts } from "@/lib/alerts";
 const DAYS_BEFORE_EXPIRY = 10;
 
 export async function GET(request: NextRequest) {
-  const authHeader = request.headers.get("authorization");
-  const cronSecret = process.env.CRON_SECRET || process.env.NEXTAUTH_SECRET;
-
-  if (authHeader !== `Bearer ${cronSecret}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },
       { status: 401 }
@@ -23,15 +22,16 @@ export async function GET(request: NextRequest) {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
   const usageReset = await prisma.workspace.updateMany({
-    where: { usagePeriodStart: { lt: monthStart } },
+    where: { usagePeriodStart: { lt: monthStart }, ...(isFeastMode() ? { id: FEAST_WORKSPACE_ID } : {}) },
     data: {
       usagePeriodStart: monthStart,
       dmsSentThisPeriod: 0,
     },
   });
 
-  const accountsToRefresh = await prisma.instagramAccount.findMany({
+  const candidateAccounts = await prisma.instagramAccount.findMany({
     where: {
+      ...cronAccountFilter(),
       accessToken: { not: "" },
       tokenExpiresAt: {
         not: null,
@@ -41,10 +41,13 @@ export async function GET(request: NextRequest) {
     select: {
       id: true,
       workspaceId: true,
+      instagramId: true,
       username: true,
       accessToken: true,
     },
   });
+
+  const accountsToRefresh = candidateAccounts.filter(isCronAccountAllowed);
 
   const results: Array<{
     instagramAccountId: string;
@@ -98,7 +101,9 @@ export async function GET(request: NextRequest) {
     }
   }
 
-  const alertableWorkspaces = await prisma.workspace.findMany({
+  // Pilot monitoring uses infrastructure alarms and in-app diagnostics; SSO
+  // identities have no email and the legacy alert scan is outside its scope.
+  const alertableWorkspaces = isFeastMode() ? [] : await prisma.workspace.findMany({
     where: { alertsEnabled: true },
     select: { id: true },
   });

@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import { getWorkerHealth } from "@/lib/ops/worker-health";
+import { auth } from "@/lib/auth";
+import { isFeastMode } from "@/lib/feast/config";
 
 export const runtime = "nodejs";
 // Health must reflect live state (worker heartbeat, queue depth), never a
@@ -57,6 +59,9 @@ async function checkQueue(): Promise<HealthCheck & { counts?: unknown }> {
 }
 
 export async function GET() {
+  if (isFeastMode() && !await auth()) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
   const [database, redis, queue, worker] = await Promise.all([
     checkDatabase(),
     checkRedis(),

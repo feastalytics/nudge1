@@ -1,3 +1,5 @@
+import { cronAccountFilter, isAuthorizedCronRequest, isCronAccountAllowed } from "@/lib/feast/cron";
+import { FEAST_WORKSPACE_ID, isFeastMode } from "@/lib/feast/config";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
 import { getUserMedia, type InstagramMedia } from "@/lib/meta/client";
@@ -18,10 +20,7 @@ function isReel(media: InstagramMedia): boolean {
 }
 
 export async function GET(request: NextRequest) {
-  const authHeader = request.headers.get("authorization");
-  const cronSecret = process.env.CRON_SECRET || process.env.NEXTAUTH_SECRET;
-
-  if (authHeader !== `Bearer ${cronSecret}`) {
+  if (!isAuthorizedCronRequest(request)) {
     return NextResponse.json(
       { success: false, error: "Unauthorized" },
       { status: 401 }
@@ -29,7 +28,7 @@ export async function GET(request: NextRequest) {
   }
 
   const pending = await prisma.automation.findMany({
-    where: { pendingNextReel: true },
+    where: { pendingNextReel: true, ...(isFeastMode() ? { workspaceId: FEAST_WORKSPACE_ID, instagramAccount: cronAccountFilter() } : {}) },
     include: { instagramAccount: true },
   });
 
@@ -39,6 +38,7 @@ export async function GET(request: NextRequest) {
     { account: (typeof pending)[number]["instagramAccount"]; automations: typeof pending }
   >();
   for (const automation of pending) {
+    if (!isCronAccountAllowed(automation.instagramAccount) || (isFeastMode() && automation.workspaceId !== FEAST_WORKSPACE_ID)) continue;
     const key = automation.instagramAccountId;
     const entry = byAccount.get(key);
     if (entry) entry.automations.push(automation);

@@ -43,6 +43,11 @@ next-env.d.ts
 
 /app/generated/prisma
 
+# Local deployment test bytecode and operator-only release manifest
+__pycache__/
+*.pyc
+/deploy/release.json
+
 # graphify local knowledge-graph tooling output
 /graphify-out
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=Consistent Nudge database and queue backup to private S3
+After=nudge.service
+Requires=nudge.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/bin/bash /opt/nudge/current/deploy/backup.sh
+TimeoutStartSec=600

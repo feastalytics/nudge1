@@ -1,788 +1,187 @@
 import { Worker, type Job } from "bullmq";
-import {
-  getDMQueue,
-  getRedisConnection,
-  POSTBACK_JOB_NAME,
-  type DmQueueJob,
-  type ProcessCommentJob,
-  type ProcessPostbackJob,
-} from "./client";
+import { getRedisConnection, POSTBACK_JOB_NAME, type DmQueueJob, type ProcessCommentJob, type ProcessPostbackJob } from "./client";
 import { prisma } from "@/lib/db/client";
-import { Prisma } from "@/app/generated/prisma/client";
 import {
-  MetaApiError,
-  sendCommentReply,
-  sendDirectMessage,
-  sendDirectMessageWithButton,
-  sendDirectMessageWithLinkButton,
-  sendPrivateReply,
-  sendPrivateReplyWithButton,
+  MetaApiError, sendCommentReply, sendDirectMessage, sendDirectMessageWithButton,
+  sendDirectMessageWithLinkButton, sendPrivateReply, sendPrivateReplyWithButton,
   sendPrivateReplyWithLinkButton,
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { reserveDMSlot } from "@/lib/utils/rate-limiter";
-import {
-  releaseWorkspaceDMReservation,
-  reserveWorkspaceDMSend,
-} from "@/lib/billing/usage";
+import { releaseWorkspaceDMReservation, reserveWorkspaceDMSend } from "@/lib/billing/usage";
 import { recordWorkerActivity, recordWorkerAlert } from "@/lib/ops/worker-health";
-import {
-  buildTrackedUrl,
-  renderMessageWithTracking,
-  renderMessageWithoutLink,
-} from "@/lib/tracking/message";
+import { buildTrackedUrl, renderMessageWithTracking, renderMessageWithoutLink } from "@/lib/tracking/message";
+import { canFallBackToText, performDelivery } from "./delivery";
+import { assertSendAllowed, isOwnedInstagramAccount, isFeastPilot } from "./send-policy";
+import { enqueueDurably } from "./outbox";
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
-
 function formatError(error: unknown): string {
-  if (error instanceof MetaApiError) {
-    return `Meta API Error ${error.code}: ${error.message}`;
-  }
-  if (error instanceof Error) {
-    return error.message;
-  }
-  return "Unknown error";
+  if (error instanceof MetaApiError) return `Meta API Error ${error.code}: ${error.message}`;
+  return error instanceof Error ? error.message : "Unknown error";
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
-  const {
-    instagramAccountId,
-    commentId,
-    commentText,
-    commenterId,
-    commenterName,
-    mediaId,
-  } = job.data;
-  const requeueAttempt = job.data.requeueAttempt ?? 0;
-
+  const { instagramAccountId, commentId, commentText, commenterId, commenterName, mediaId } = job.data;
   const automations = await prisma.automation.findMany({
-    where: {
-      // Match campaigns bound to this specific post, plus any-post campaigns.
-      OR: [{ postId: mediaId }, { matchAnyPost: true }],
-      isActive: true,
-      instagramAccount: {
-        instagramId: instagramAccountId,
-      },
-    },
-    include: {
-      instagramAccount: true,
-      workspace: true,
-      trackedLinks: {
-        select: {
-          slug: true,
-          destinationUrl: true,
-        },
-        orderBy: { createdAt: "asc" },
-      },
-    },
+    where: { ...(isFeastPilot() ? { workspaceId: "feast-internal" } : {}), OR: [{ postId: mediaId }, { matchAnyPost: true }], isActive: true, instagramAccount: { instagramId: instagramAccountId } },
+    include: { instagramAccount: true, workspace: true, trackedLinks: { select: { slug: true, destinationUrl: true }, orderBy: { createdAt: "asc" } } },
     orderBy: { createdAt: "asc" },
   });
-
   for (const automation of automations) {
-    // "Any word" campaigns fire on every comment; otherwise require a keyword hit.
-    const matchResult = automation.matchAnyWord
-      ? { matched: true, matchedKeyword: null }
-      : matchKeywords(
-          commentText,
-          automation.keywords,
-          automation.wholeWordMatch
-        );
-
-    if (!matchResult.matched) {
-      continue;
-    }
-
-    const existingLog = await prisma.dmLog.findUnique({
-      where: {
-        automationId_commentId: {
-          automationId: automation.id,
-          commentId,
-        },
-      },
+    const match = automation.matchAnyWord ? { matched: true, matchedKeyword: null } : matchKeywords(commentText, automation.keywords, automation.wholeWordMatch);
+    if (!match.matched) continue;
+    const key = { automationId: automation.id, commentId };
+    // Upsert does not reset delivery state. A retried or concurrent job must
+    // observe the previous attempt, especially UNKNOWN and SENDING claims.
+    const log = await prisma.dmLog.upsert({
+      where: { automationId_commentId: key },
+      create: { workspaceId: automation.workspaceId, ...key, instagramAccountId: automation.instagramAccountId,
+        commenterId, commenterName, commentText, matchedKeyword: match.matchedKeyword,
+        status: "PENDING", attempts: job.attemptsMade + 1 },
+      update: {},
     });
-
-    const alreadyDmd = existingLog?.status === "SENT";
-    const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd;
-
-    // Skip only when there is genuinely nothing left to do. A comment whose DM
-    // already sent but whose public reply never posted (e.g. it hit a rate
-    // limit) must still come back so the public reply can be retried.
-    if (alreadyDmd && (alreadyPublicReplied || !automation.publicReplyEnabled)) {
-      continue;
-    }
-
-    if (!automation.instagramAccount.accessToken) {
-      await prisma.dmLog.upsert({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
-        create: {
-          workspaceId: automation.workspaceId,
-          automationId: automation.id,
-          instagramAccountId: automation.instagramAccountId,
-          commenterId,
-          commenterName,
-          commentText,
-          commentId,
-          matchedKeyword: matchResult.matchedKeyword,
-          status: "FAILED",
-          errorMessage: "No Instagram access token available",
-        },
-        update: {
-          status: "FAILED",
-          errorMessage: "No Instagram access token available",
-        },
-      });
-      continue;
-    }
-
+    if (log.dmDeliveryState !== "PENDING" && (!automation.publicReplyEnabled || log.publicReplyDeliveryState !== "PENDING")) continue;
     let accessToken: string;
     try {
+      if (!automation.instagramAccount.accessToken) throw new Error("No Instagram access token available");
       accessToken = decryptToken(automation.instagramAccount.accessToken);
-    } catch {
-      await prisma.dmLog.upsert({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
-        create: {
-          workspaceId: automation.workspaceId,
-          automationId: automation.id,
-          instagramAccountId: automation.instagramAccountId,
-          commenterId,
-          commenterName,
-          commentText,
-          commentId,
-          matchedKeyword: matchResult.matchedKeyword,
-          status: "FAILED",
-          errorMessage: "Failed to decrypt Instagram access token",
-        },
-        update: {
-          status: "FAILED",
-          errorMessage: "Failed to decrypt Instagram access token",
-        },
-      });
+    } catch (error) {
+      await prisma.dmLog.update({ where: { automationId_commentId: key }, data: { status: "FAILED", errorMessage: formatError(error) } });
       continue;
     }
-
-    // Ensure a log row exists before the public reply leg (which updates it).
-    // Only (re)set PENDING when the DM will actually be attempted, so a prior
-    // SENT is never clobbered while we come back just to retry the public reply.
-    if (!existingLog) {
-      try {
-        await prisma.dmLog.create({
-          data: {
-            workspaceId: automation.workspaceId,
-            automationId: automation.id,
-            instagramAccountId: automation.instagramAccountId,
-            commenterId,
-            commenterName,
-            commentText,
-            commentId,
-            matchedKeyword: matchResult.matchedKeyword,
-            status: "PENDING",
-            attempts: job.attemptsMade + 1,
-          },
-        });
-      } catch (error) {
-        // A concurrent duplicate job for the same comment — the polling
-        // reconciler enqueues without a deterministic jobId by design (see
-        // lib/polling/comment-reconciler.ts) — can create this row between
-        // our fetch of existingLog and now. Treat "it already exists" as a
-        // race we lost, not a bug: leave whatever state the winning job set
-        // untouched rather than crashing this job.
-        const isDuplicateRow =
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === "P2002";
-        if (!isDuplicateRow) throw error;
-      }
-    } else if (needsDm) {
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: { automationId: automation.id, commentId },
-        },
-        data: {
-          status: "PENDING",
-          attempts: job.attemptsMade + 1,
-          matchedKeyword: matchResult.matchedKeyword,
-          errorMessage: null,
-        },
+    const replies = automation.publicReplyMessages.length ? automation.publicReplyMessages : automation.publicReplyMessage ? [automation.publicReplyMessage] : [];
+    if (job.data.ownerHasReplied) {
+      await prisma.dmLog.updateMany({ where: { ...key, publicReplyDeliveryState: "PENDING" },
+        data: { publicReplyDeliveryState: "REJECTED", publicReplyError: "Skipped: account already replied on Instagram" } });
+    }
+    if (automation.publicReplyEnabled && replies.length && !job.data.ownerHasReplied) {
+      await performDelivery(key, "publicReply", async () => {
+        assertSendAllowed(instagramAccountId);
+        const message = renderMessageWithTracking({ message: replies[Math.floor(Math.random() * replies.length)], commenterName, trackedLinks: automation.trackedLinks });
+        return (await sendCommentReply(accessToken, commentId, message, instagramAccountId)).id;
       });
     }
+    if (log.dmDeliveryState !== "PENDING") continue;
 
-    // Public reply leg — decoupled from the DM and posted first so a DM failure
-    // (e.g. a non-follower whose messaging is restricted) never suppresses it.
-    // Idempotent across retries via publicReplySentAt.
-    const replyPool =
-      automation.publicReplyMessages.length > 0
-        ? automation.publicReplyMessages
-        : automation.publicReplyMessage
-          ? [automation.publicReplyMessage]
-          : [];
-    if (
-      automation.publicReplyEnabled &&
-      replyPool.length > 0 &&
-      !existingLog?.publicReplySentAt
-    ) {
-      // Atomically claim the "send a public reply" slot instead of trusting
-      // the existingLog check above: two concurrent job instances for the
-      // same comment (e.g. the polling reconciler racing the webhook — the
-      // reconciler deliberately has no deterministic jobId, see
-      // lib/polling/comment-reconciler.ts) can both pass that check before
-      // either has committed. Only the job whose conditional update
-      // actually flips a row wins the race and proceeds to call Instagram.
-      const claimed = await prisma.dmLog.updateMany({
-        where: {
-          automationId: automation.id,
-          commentId,
-          publicReplySentAt: null,
-        },
-        data: { publicReplySentAt: new Date() },
-      });
-
-      if (claimed.count > 0) {
-        try {
-          const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
-          const publicReply = renderMessageWithTracking({
-            message: chosen,
-            commenterName,
-            trackedLinks: automation.trackedLinks,
-          });
-          await sendCommentReply(accessToken, commentId, publicReply);
-          await prisma.dmLog.update({
-            where: {
-              automationId_commentId: { automationId: automation.id, commentId },
-            },
-            data: { publicReplyError: null },
-          });
-        } catch (error) {
-          console.error(
-            "[DM Worker] Public comment reply failed:",
-            formatError(error)
-          );
-          // Send failed — release the claim so a later pass can retry.
-          await prisma.dmLog
-            .update({
-              where: {
-                automationId_commentId: { automationId: automation.id, commentId },
-              },
-              data: {
-                publicReplySentAt: null,
-                publicReplyError: formatError(error),
-              },
-            })
-            .catch(() => {});
-        }
-      }
-    }
-
-    // DM already sent on an earlier pass; the public reply retry above was all
-    // this run needed. Don't re-send the DM.
-    if (!needsDm) continue;
-
-    // Atomically claim the DM-send slot — same race as the public reply
-    // above (a concurrent duplicate job for this comment from the polling
-    // reconciler's non-deterministic job IDs) applies equally here, and
-    // `needsDm` above is a stale snapshot from the top of this function, not
-    // a live check. Only the job that flips this row proceeds to send;
-    // every exit below (skip, rate-limit, requeue, or failure) releases the
-    // claim in the `finally` so retries still work.
-    const dmClaim = await prisma.dmLog.updateMany({
-      where: {
-        automationId: automation.id,
-        commentId,
-        dmSentAt: null,
-      },
-      data: { dmSentAt: new Date() },
-    });
-    if (dmClaim.count === 0) continue;
-
-    let dmSent = false;
-    try {
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
-
-    let rateLimit;
+    let retainUsage = false;
     try {
-      rateLimit = await reserveDMSlot(instagramAccountId, requeueAttempt);
-    } catch (error) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart
-      );
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
-        data: {
-          status: "FAILED",
-          attempts: job.attemptsMade + 1,
-          errorMessage: formatError(error),
-        },
-      });
-      throw error;
-    }
-
-    if (!rateLimit.allowed) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart
-      );
-
-      if (rateLimit.shouldSkip) {
-        await prisma.dmLog.update({
-          where: {
-            automationId_commentId: {
-              automationId: automation.id,
-              commentId,
-            },
-          },
-          data: {
-            status: "SKIPPED_RATE_LIMIT",
-            matchedKeyword: matchResult.matchedKeyword,
-            errorMessage: "Hourly Instagram DM rate limit reached",
-          },
-        });
-        continue;
-      }
-
-      if (rateLimit.shouldRequeue) {
-        await prisma.dmLog.update({
-          where: {
-            automationId_commentId: {
-              automationId: automation.id,
-              commentId,
-            },
-          },
-          data: {
-            status: "PENDING",
-            matchedKeyword: matchResult.matchedKeyword,
-            errorMessage: "Hourly rate limit hit; retry scheduled",
-          },
-        });
-
-        await getDMQueue().add(
-          "process-comment",
-          {
-            ...job.data,
-            requeueAttempt: requeueAttempt + 1,
-          },
-          {
-            delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
-          }
-        );
-        continue;
-      }
-    }
-
-    // With an opening DM, the private reply is a button message; tapping it
-    // fires a postback that delivers either the follow step or the reveal
-    // (see processPostback). Without an opening DM, we send the reveal text
-    // directly as today.
-    const useOpeningDm =
-      automation.openingDmEnabled &&
-      Boolean(automation.openingDmMessage) &&
-      Boolean(automation.openingDmButtonLabel);
-    const useFollowStep =
-      automation.followStepEnabled &&
-      Boolean(automation.followStepMessage) &&
-      Boolean(automation.followStepButtonLabel);
-
-    try {
-      if (useOpeningDm) {
-        const openingText = renderMessageWithTracking({
-          message: automation.openingDmMessage as string,
-          commenterName,
-          trackedLinks: [],
-        });
-        const openingPayload = useFollowStep
-          ? `follow:${automation.id}`
-          : `reveal:${automation.id}`;
-        await sendPrivateReplyWithButton(
-          accessToken,
-          automation.instagramAccount.instagramId,
-          commentId,
-          openingText,
-          automation.openingDmButtonLabel as string,
-          openingPayload
-        );
-      } else if (automation.trackedLinks[0]) {
-        // Try button template first; if Meta rejects it, fall back to inline link.
-        const bodyText =
-          renderMessageWithoutLink({
-            message: automation.dmMessage,
-            commenterName,
-          }) || "Here's your link:";
-        const trackedUrl = buildTrackedUrl(automation.trackedLinks[0].slug);
-
-        try {
-          await sendPrivateReplyWithLinkButton(
-            accessToken,
-            automation.instagramAccount.instagramId,
-            commentId,
-            bodyText,
-            automation.linkButtonLabel || "Open link",
-            trackedUrl
-          );
-        } catch (buttonError) {
-          // Button template rejected; send as text with inline link instead.
-          console.log(
-            "[DM Worker] Button template rejected, falling back to inline link:",
-            formatError(buttonError)
-          );
-          const fallbackMessage =
-            renderMessageWithTracking({
-              message: automation.dmMessage,
-              commenterName,
-              trackedLinks: [automation.trackedLinks[0]],
-            }) || `${bodyText}\n${trackedUrl}`;
-          await sendPrivateReply(
-            accessToken,
-            automation.instagramAccount.instagramId,
-            commentId,
-            fallbackMessage
-          );
+      const rateLimit = await reserveDMSlot(instagramAccountId, job.data.requeueAttempt ?? 0);
+      if (!rateLimit.allowed) {
+        await prisma.dmLog.update({ where: { automationId_commentId: key }, data: {
+          status: rateLimit.shouldSkip ? "SKIPPED_RATE_LIMIT" : "PENDING",
+          errorMessage: rateLimit.shouldSkip ? "Hourly Instagram DM rate limit reached" : "Hourly rate limit hit; retry scheduled",
+        } });
+        if (rateLimit.shouldRequeue) {
+          const attempt = (job.data.requeueAttempt ?? 0) + 1;
+          const { outboxId: _outboxId, ...data } = job.data;
+          await enqueueDurably("process-comment", { ...data, requeueAttempt: attempt },
+            `comment:${instagramAccountId}:${commentId}:retry:${attempt}`, rateLimit.requeueDelayMs);
         }
-      } else {
-        const dmMessage = renderMessageWithTracking({
-          message: automation.dmMessage,
-          commenterName,
-          trackedLinks: automation.trackedLinks,
-        });
-        await sendPrivateReply(
-          accessToken,
-          automation.instagramAccount.instagramId,
-          commentId,
-          dmMessage
-        );
+        continue;
       }
-
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
-        data: {
-          status: "SENT",
-          dmSentAt: new Date(),
-          errorMessage: null,
-        },
+      retainUsage = true; // A failed result write can follow an accepted send.
+      const result = await performDelivery(key, "dm", async () => {
+        assertSendAllowed(instagramAccountId);
+        const opening = automation.openingDmEnabled && automation.openingDmMessage && automation.openingDmButtonLabel;
+        if (opening) {
+          const useFollow = automation.followStepEnabled && automation.followStepMessage && automation.followStepButtonLabel;
+          const text = renderMessageWithTracking({ message: automation.openingDmMessage!, commenterName, trackedLinks: [] });
+          return (await sendPrivateReplyWithButton(accessToken, instagramAccountId, commentId, text,
+            automation.openingDmButtonLabel!, `${useFollow ? "follow" : "reveal"}:${automation.id}`)).message_id;
+        }
+        const link = automation.trackedLinks[0];
+        if (link) {
+          const text = renderMessageWithoutLink({ message: automation.dmMessage, commenterName }) || "Here's your link:";
+          const url = buildTrackedUrl(link.slug);
+          try {
+            return (await sendPrivateReplyWithLinkButton(accessToken, instagramAccountId, commentId, text,
+              automation.linkButtonLabel || "Open link", url)).message_id;
+          } catch (error) {
+            if (!canFallBackToText(error)) throw error;
+            const fallback = renderMessageWithTracking({ message: automation.dmMessage, commenterName, trackedLinks: [link] }) || `${text}\n${url}`;
+            return (await sendPrivateReply(accessToken, instagramAccountId, commentId, fallback)).message_id;
+          }
+        }
+        const text = renderMessageWithTracking({ message: automation.dmMessage, commenterName, trackedLinks: automation.trackedLinks });
+        return (await sendPrivateReply(accessToken, instagramAccountId, commentId, text)).message_id;
       });
-      dmSent = true;
-    } catch (error) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart
-      );
-
-      await prisma.dmLog.update({
-        where: {
-          automationId_commentId: {
-            automationId: automation.id,
-            commentId,
-          },
-        },
-        data: {
-          status: "FAILED",
-          attempts: job.attemptsMade + 1,
-          errorMessage: formatError(error),
-        },
-      });
-      throw error;
-    }
+      // Unknown sends may have been delivered. Keep usage reserved until a
+      // human reconciles; never undercount uncertain delivery as a safe retry.
+      retainUsage = result === "SENT" || result === "UNKNOWN";
     } finally {
-      if (!dmSent) {
-        await prisma.dmLog
-          .update({
-            where: {
-              automationId_commentId: { automationId: automation.id, commentId },
-            },
-            data: { dmSentAt: null },
-          })
-          .catch(() => {});
-      }
+      if (!retainUsage) await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
     }
   }
 }
 
-/**
- * Deliver the follow-step message after a user taps an opening DM's button,
- * when the campaign has a follow step configured. The postback payload is
- * `follow:<automationId>`. The follow step's own button carries
- * `reveal:<automationId>`, so tapping it delivers the reveal exactly like a
- * campaign without a follow step.
- */
-async function processFollowPostback(
-  instagramAccountId: string,
-  userId: string,
-  automationId: string
-): Promise<void> {
-  const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true },
-    include: { instagramAccount: true },
-  });
-
-  if (
-    !automation ||
-    automation.instagramAccount.instagramId !== instagramAccountId ||
-    !automation.instagramAccount.accessToken ||
-    !automation.followStepEnabled ||
-    !automation.followStepMessage ||
-    !automation.followStepButtonLabel
-  ) {
-    return;
-  }
-
-  const dedupeId = `follow:${userId}`;
-
-  const openingLog = await prisma.dmLog.findFirst({
-    where: { automationId: automation.id, commenterId: userId },
-    select: { commenterName: true },
-  });
-  const commenterName = openingLog?.commenterName ?? null;
-
-  let accessToken: string;
-  try {
-    accessToken = decryptToken(automation.instagramAccount.accessToken);
-  } catch {
-    return;
-  }
-
-  const usage = await reserveWorkspaceDMSend(automation.workspaceId);
-
-  try {
-    const followText = renderMessageWithTracking({
-      message: automation.followStepMessage,
-      commenterName,
-      trackedLinks: [],
-    });
-    await sendDirectMessageWithButton(
-      accessToken,
-      automation.instagramAccount.instagramId,
-      userId,
-      followText,
-      automation.followStepButtonLabel,
-      `reveal:${automation.id}`
-    );
-    await prisma.dmLog.upsert({
-      where: {
-        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
-      },
-      create: {
-        workspaceId: automation.workspaceId,
-        automationId: automation.id,
-        instagramAccountId: automation.instagramAccountId,
-        commenterId: userId,
-        commenterName,
-        commentText: "(button tap)",
-        commentId: dedupeId,
-        status: "SENT",
-        dmSentAt: new Date(),
-      },
-      update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
-    });
-  } catch (error) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-    await prisma.dmLog.upsert({
-      where: {
-        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
-      },
-      create: {
-        workspaceId: automation.workspaceId,
-        automationId: automation.id,
-        instagramAccountId: automation.instagramAccountId,
-        commenterId: userId,
-        commenterName,
-        commentText: "(button tap)",
-        commentId: dedupeId,
-        status: "FAILED",
-        errorMessage: formatError(error),
-      },
-      update: { status: "FAILED", errorMessage: formatError(error) },
-    });
-    throw error;
-  }
-}
-
-/**
- * Deliver the reveal message after a user taps an opening DM's button (or,
- * when a follow step is configured, after tapping the follow step's own
- * button). The postback payload is `reveal:<automationId>`; the sender is
- * the user's IGSID (same id as their comment author id), which we DM
- * directly.
- */
-async function processRevealPostback(
-  instagramAccountId: string,
-  userId: string,
-  automationId: string
-): Promise<void> {
-  const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true },
-    include: {
-      instagramAccount: true,
-      workspace: true,
-      trackedLinks: {
-        select: { slug: true, destinationUrl: true },
-        orderBy: { createdAt: "asc" },
-      },
-    },
-  });
-
-  if (
-    !automation ||
-    automation.instagramAccount.instagramId !== instagramAccountId ||
-    !automation.instagramAccount.accessToken
-  ) {
-    return;
-  }
-
-  // Duplicate sends are enabled: every button tap re-sends the reveal
-  // instead of only firing once per person.
-  const dedupeId = `reveal:${userId}`;
-
-  // Personalize {username} from the opening DM log for this user, if present.
-  const openingLog = await prisma.dmLog.findFirst({
-    where: { automationId: automation.id, commenterId: userId },
-    select: { commenterName: true },
-  });
-  const commenterName = openingLog?.commenterName ?? null;
-
-  let accessToken: string;
-  try {
-    accessToken = decryptToken(automation.instagramAccount.accessToken);
-  } catch {
-    return;
-  }
-
-  const usage = await reserveWorkspaceDMSend(automation.workspaceId);
-
-  const primaryLink = automation.trackedLinks[0];
-
-  try {
-    if (primaryLink) {
-      // Try button template first; if Meta rejects it, fall back to inline link.
-      const bodyText =
-        renderMessageWithoutLink({
-          message: automation.dmMessage,
-          commenterName,
-        }) || "Here's your link:";
-      const trackedUrl = buildTrackedUrl(primaryLink.slug);
-
-      try {
-        await sendDirectMessageWithLinkButton(
-          accessToken,
-          automation.instagramAccount.instagramId,
-          userId,
-          bodyText,
-          automation.linkButtonLabel || "Open link",
-          trackedUrl
-        );
-      } catch (buttonError) {
-        // Button template rejected; send as text with inline link instead.
-        console.log(
-          "[DM Worker] Button template rejected in postback, falling back to inline link:",
-          formatError(buttonError)
-        );
-        const fallbackMessage =
-          renderMessageWithTracking({
-            message: automation.dmMessage,
-            commenterName,
-            trackedLinks: [primaryLink],
-          }) || `${bodyText}\n${trackedUrl}`;
-        await sendDirectMessage(
-          accessToken,
-          automation.instagramAccount.instagramId,
-          userId,
-          fallbackMessage
-        );
-      }
-    } else {
-      const revealMessage = renderMessageWithTracking({
-        message: automation.dmMessage,
-        commenterName,
-        trackedLinks: automation.trackedLinks,
-      });
-      await sendDirectMessage(
-        accessToken,
-        automation.instagramAccount.instagramId,
-        userId,
-        revealMessage
-      );
-    }
-    await prisma.dmLog.upsert({
-      where: {
-        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
-      },
-      create: {
-        workspaceId: automation.workspaceId,
-        automationId: automation.id,
-        instagramAccountId: automation.instagramAccountId,
-        commenterId: userId,
-        commenterName,
-        commentText: "(button tap)",
-        commentId: dedupeId,
-        status: "SENT",
-        dmSentAt: new Date(),
-      },
-      update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
-    });
-  } catch (error) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-    await prisma.dmLog.upsert({
-      where: {
-        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
-      },
-      create: {
-        workspaceId: automation.workspaceId,
-        automationId: automation.id,
-        instagramAccountId: automation.instagramAccountId,
-        commenterId: userId,
-        commenterName,
-        commentText: "(button tap)",
-        commentId: dedupeId,
-        status: "FAILED",
-        errorMessage: formatError(error),
-      },
-      update: { status: "FAILED", errorMessage: formatError(error) },
-    });
-    throw error;
-  }
-}
-
-/**
- * Dispatches a postback job to the follow step or the reveal, based on the
- * payload prefix set when the triggering button was sent.
- */
 async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   const { instagramAccountId, userId, payload } = job.data;
-
-  if (payload.startsWith("follow:")) {
-    const automationId = payload.slice("follow:".length);
-    return processFollowPostback(instagramAccountId, userId, automationId);
-  }
-  if (payload.startsWith("reveal:")) {
-    const automationId = payload.slice("reveal:".length);
-    return processRevealPostback(instagramAccountId, userId, automationId);
+  const stage = payload.startsWith("follow:") ? "follow" : payload.startsWith("reveal:") ? "reveal" : null;
+  if (!stage) return;
+  const automation = await prisma.automation.findFirst({
+    where: { ...(isFeastPilot() ? { workspaceId: "feast-internal" } : {}), id: payload.slice(stage.length + 1), isActive: true, instagramAccount: { instagramId: instagramAccountId } },
+    include: { instagramAccount: true, trackedLinks: { select: { slug: true, destinationUrl: true }, orderBy: { createdAt: "asc" } } },
+  });
+  if (!automation?.instagramAccount.accessToken) return;
+  if (stage === "follow" && !(automation.followStepEnabled && automation.followStepMessage && automation.followStepButtonLabel)) return;
+  const opening = await prisma.dmLog.findFirst({ where: { automationId: automation.id, commenterId: userId }, select: { commenterName: true } });
+  const commenterName = opening?.commenterName;
+  // One delivery per campaign/person/stage, including across repeated button
+  // taps and webhook redelivery. A new campaign starts a new conversation flow.
+  const key = { automationId: automation.id, commentId: `${stage}:${userId}` };
+  const log = await prisma.dmLog.upsert({
+    where: { automationId_commentId: key },
+    create: { ...key, workspaceId: automation.workspaceId, instagramAccountId: automation.instagramAccountId,
+      commenterId: userId, commenterName, commentText: "(button tap)", status: "PENDING" }, update: {},
+  });
+  if (log.dmDeliveryState !== "PENDING") return;
+  const accessToken = decryptToken(automation.instagramAccount.accessToken);
+  const usage = await reserveWorkspaceDMSend(automation.workspaceId);
+  let retainUsage = false;
+  try {
+    const rateLimit = await reserveDMSlot(instagramAccountId);
+    if (!rateLimit.allowed) throw new Error("Instagram DM rate limit reached; postback queued for retry");
+    retainUsage = true; // Keep uncertain sends counted if persistence fails.
+    const result = await performDelivery(key, "dm", async () => {
+      assertSendAllowed(instagramAccountId);
+      if (stage === "follow") {
+        const text = renderMessageWithTracking({ message: automation.followStepMessage!, commenterName, trackedLinks: [] });
+        return (await sendDirectMessageWithButton(accessToken, instagramAccountId, userId, text,
+          automation.followStepButtonLabel!, `reveal:${automation.id}`)).message_id;
+      }
+      const link = automation.trackedLinks[0];
+      if (link) {
+        const text = renderMessageWithoutLink({ message: automation.dmMessage, commenterName }) || "Here's your link:";
+        const url = buildTrackedUrl(link.slug);
+        try {
+          return (await sendDirectMessageWithLinkButton(accessToken, instagramAccountId, userId, text, automation.linkButtonLabel || "Open link", url)).message_id;
+        } catch (error) {
+          if (!canFallBackToText(error)) throw error;
+          const fallback = renderMessageWithTracking({ message: automation.dmMessage, commenterName, trackedLinks: [link] }) || `${text}\n${url}`;
+          return (await sendDirectMessage(accessToken, instagramAccountId, userId, fallback)).message_id;
+        }
+      }
+      const text = renderMessageWithTracking({ message: automation.dmMessage, commenterName, trackedLinks: automation.trackedLinks });
+      return (await sendDirectMessage(accessToken, instagramAccountId, userId, text)).message_id;
+    });
+    retainUsage = result === "SENT" || result === "UNKNOWN";
+  } finally {
+    if (!retainUsage) await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
   }
 }
 
 async function processJob(job: Job<DmQueueJob>): Promise<void> {
-  if (job.name === POSTBACK_JOB_NAME) {
-    return processPostback(job as Job<ProcessPostbackJob>);
+  if (isOwnedInstagramAccount(job.data.instagramAccountId)) {
+    assertSendAllowed(job.data.instagramAccountId);
+    if (job.name === POSTBACK_JOB_NAME) await processPostback(job as Job<ProcessPostbackJob>);
+    else await processComment(job as Job<ProcessCommentJob>);
   }
-  return processComment(job as Job<ProcessCommentJob>);
+  if (job.data.outboxId) {
+    await prisma.queueOutbox.update({ where: { id: job.data.outboxId }, data: { completedAt: new Date() } });
+  }
 }
 
 async function recordWorkerFailure(
@@ -836,19 +235,10 @@ export function createDMWorker(): Worker<DmQueueJob> {
     processJob,
     {
       connection: getRedisConnection(),
-      concurrency: 5,
-      // Defaults (drainDelay: 5s, stalledInterval: 30s) re-poll Redis constantly
-      // even with an empty queue, which burns commands fast on a metered free
-      // tier — Upstash bills every command *inside* the stalled-check Lua script
-      // (7+ sub-commands per run), not just the EVALSHA call, so stalledInterval
-      // dominates idle cost far more than drainDelay. New jobs still wake the
-      // worker immediately regardless of either setting — they only govern
-      // idle re-poll/re-check cadence — so raising both is free in terms of
-      // responsiveness for this low-volume single-account use. A 5-minute
-      // stalled window just means a crashed job takes up to 5 min longer to
-      // recover, an acceptable tradeoff given attempts: 3 and a single worker.
-      drainDelay: 300,
-      stalledInterval: 300_000,
+      concurrency: 2,
+      drainDelay: 30,
+      stalledInterval: 30_000,
+      maxStalledCount: 1,
       settings: {
         backoffStrategy: (attemptsMade: number) =>
           BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],

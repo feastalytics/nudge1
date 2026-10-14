@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Nudge Feast-only single-host pilot; creates infrastructure but does not deploy or enable sends.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing public subnet in VpcId with an Internet Gateway route.
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  InstanceType:
+    Type: String
+    Default: t3a.medium
+    AllowedValues: [t3a.medium, t3a.large, t3.medium, t3.large]
+  DataVolumeGiB:
+    Type: Number
+    Default: 32
+    MinValue: 20
+    MaxValue: 256
+  AllocateElasticIp:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+Conditions:
+  StaticIp: !Equals [!Ref AllocateElasticIp, 'true']
+Resources:
+  RuntimeSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Nudge runtime JSON; populate manually before deployment. Never place values in CloudFormation.
+      Tags: [{Key: Application, Value: nudge}]
+  ArtifactsAndBackups:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirePilotBackups
+            Status: Enabled
+            Prefix: backups/
+            ExpirationInDays: 14
+            NoncurrentVersionExpiration: {NoncurrentDays: 14}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactsAndBackups
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ArtifactsAndBackups.Arn, !Sub '${ArtifactsAndBackups.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  Images:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      EncryptionConfiguration: {EncryptionType: AES256}
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Prune only old untagged images","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":14},"action":{"type":"expire"}}]}'
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: NudgeRuntimeOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref RuntimeSecret
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: [!Sub '${ArtifactsAndBackups.Arn}/releases/*', !Sub '${ArtifactsAndBackups.Arn}/backups/*']
+              - Effect: Allow
+                Action: [s3:PutObject, s3:AbortMultipartUpload]
+                Resource: !Sub '${ArtifactsAndBackups.Arn}/backups/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactsAndBackups.Arn
+                Condition: {StringLike: {'s3:prefix': ['backups/*', 'releases/*']}}
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt Images.Arn
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+  HostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref HostRole]}
+  HostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS application and HTTP certificate challenge only; administration through SSM.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0}
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+  Host:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref HostProfile
+      MetadataOptions: {HttpTokens: required, HttpPutResponseHopLimit: 1}
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnetId
+          AssociatePublicIpAddress: true
+          GroupSet: [!Ref HostSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: {VolumeType: gp3, VolumeSize: 16, Encrypted: true, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-nudge'}, {Key: Application, Value: nudge}]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y docker.io docker-compose-v2 awscli python3 ca-certificates
+          systemctl enable --now docker
+          install -d -m 0700 /opt/nudge /etc/nudge /run/nudge
+          # Ubuntu AWS images include the SSM agent. Deploy reviewed artifacts over SSM separately.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !GetAtt Host.AvailabilityZone
+      Size: !Ref DataVolumeGiB
+      VolumeType: gp3
+      Encrypted: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-nudge-data'}, {Key: Application, Value: nudge}]
+  DataAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties: {InstanceId: !Ref Host, VolumeId: !Ref DataVolume, Device: /dev/sdf}
+  Address:
+    Type: AWS::EC2::EIP
+    Condition: StaticIp
+    Properties: {Domain: vpc}
+  AddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: StaticIp
+    Properties: {InstanceId: !Ref Host, AllocationId: !GetAtt Address.AllocationId}
+Outputs:
+  InstanceId: {Value: !Ref Host}
+  PublicIp: {Value: !If [StaticIp, !Ref Address, !GetAtt Host.PublicIp]}
+  DataVolumeId: {Value: !Ref DataVolume}
+  RuntimeSecretArn: {Value: !Ref RuntimeSecret}
+  BackupBucket: {Value: !Ref ArtifactsAndBackups}
+  RepositoryUri: {Value: !GetAtt Images.RepositoryUri}

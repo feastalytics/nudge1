@@ -1,0 +1,101 @@
+name: nudge
+
+x-app: &app
+  env_file: /run/nudge/app.env
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  networks: [frontend, backend]
+  logging:
+    driver: local
+    options: {max-size: 10m, max-file: "3"}
+
+services:
+  web:
+    <<: *app
+    image: ${WEB_IMAGE:?Set a pinned WEB_IMAGE}
+    mem_limit: 1g
+    tmpfs: [/tmp, /app/.next/cache]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/feast/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+  worker:
+    <<: *app
+    image: ${WORKER_IMAGE:?Set a pinned WORKER_IMAGE}
+    mem_limit: 768m
+    stop_grace_period: 120s
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  cron:
+    <<: *app
+    image: ${WORKER_IMAGE:?Set a pinned WORKER_IMAGE}
+    command: [node, deploy/cron.mjs]
+    mem_limit: 128m
+    depends_on: [web]
+  migrate:
+    <<: *app
+    image: ${MIGRATE_IMAGE:?Set a pinned MIGRATE_IMAGE}
+    profiles: [tools]
+    restart: "no"
+    mem_limit: 512m
+  postgres:
+    image: ${POSTGRES_IMAGE:?Set a pinned POSTGRES_IMAGE}
+    env_file: /run/nudge/postgres.env
+    restart: unless-stopped
+    mem_limit: 768m
+    shm_size: 128m
+    volumes: [/srv/nudge/postgres:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U nudge -d nudge]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: "3"}
+  redis:
+    image: ${REDIS_IMAGE:?Set a pinned REDIS_IMAGE}
+    command: [redis-server, --appendonly, "yes", --appendfsync, everysec, --maxmemory, 96mb, --maxmemory-policy, noeviction]
+    restart: unless-stopped
+    mem_limit: 320m
+    volumes: [/srv/nudge/redis:/data]
+    networks: [backend]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: "3"}
+  caddy:
+    image: ${CADDY_IMAGE:?Set a pinned CADDY_IMAGE}
+    restart: unless-stopped
+    mem_limit: 128m
+    environment:
+      NUDGE_HOSTNAME: ${NUDGE_HOSTNAME:?Set NUDGE_HOSTNAME}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /srv/nudge/caddy-data:/data
+      - /srv/nudge/caddy-config:/config
+    networks: [frontend]
+    depends_on: [web]
+    logging:
+      driver: local
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  frontend: {}
+  backend:
+    internal: true

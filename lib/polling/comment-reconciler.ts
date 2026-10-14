@@ -1,32 +1,10 @@
-/**
- * Comment reconciliation (polling safety net).
- *
- * Instagram webhooks are best-effort and never fire for a large class of
- * comments (collapsed "load more" comments, non-follower / low-signal accounts,
- * anything Instagram filters). Those comments are otherwise invisible: never
- * replied to, never DM'd.
- *
- * This sweep is deliberately narrow. For each active campaign it looks only at
- * that campaign's post, only at recent comments, and acts on a comment ONLY when
- * both are true:
- *   1. the comment matches the campaign keyword, and
- *   2. the account owner has not already replied to it.
- * The reply check reads the comment's actual replies on Instagram, so a comment
- * you (or the tool) already answered is skipped — the poll never re-touches
- * handled comments. Each sweep is capped so it can never flood the comment API
- * (which Instagram rate-limits aggressively, error 368).
- *
- * It runs on an interval in the worker process because Vercel's free crons only
- * fire once a day. Matching and sending reuse the worker's processComment, so
- * rate limiting and logging behave exactly as for webhook-delivered comments.
- *
- * Known limitation, handled not fixed: comments removed by Instagram's Hidden
- * Words / spam filter may not be returned by the Graph API at all. Disable that
- * filter on the account to widen results.
- */
+/** Poll recent campaign comments to recover missed webhooks. Public reply and
+ * DM delivery are independent: an existing reply never hides a missing DM.
+ * Ambiguous outcomes stay quarantined and are never retried by this sweep. */
 
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { enqueueDurably } from "@/lib/queue/outbox";
+import { isOwnedInstagramAccount, isSendingEnabled, isFeastPilot } from "@/lib/queue/send-policy";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -38,12 +16,17 @@ import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 // Only consider comments from the last few days — older ones are outside
 // Instagram's private-reply window anyway, so a DM to them would just fail.
-const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
+const LOOKBACK_HOURS = boundedNumber(process.env.COMMENT_POLL_LOOKBACK_HOURS, 72, 1, 168);
 // Hard cap on how many new comments a single campaign can enqueue per sweep, so
 // a viral post drains gradually instead of bursting into the comment API.
-const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
+const MAX_NEW_PER_SWEEP = boundedNumber(process.env.COMMENT_POLL_MAX_PER_SWEEP, 30, 1, 100);
 // For "any post" campaigns, how many recent posts to scan.
 const RECENT_MEDIA_LIMIT = 10;
+
+function boundedNumber(value: string | undefined, fallback: number, min: number, max: number): number {
+  const number = value === undefined ? fallback : Number(value);
+  return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.floor(number))) : fallback;
+}
 
 interface SweepStat {
   campaign: string;
@@ -62,8 +45,9 @@ function errMessage(error: unknown): string {
 
 /** One reconciliation pass across every active campaign. */
 export async function reconcileComments(): Promise<void> {
+  if (!isSendingEnabled()) return;
   const automations = await prisma.automation.findMany({
-    where: { isActive: true },
+    where: { isActive: true, ...(isFeastPilot() ? { workspaceId: "feast-internal" } : {}) },
     select: {
       id: true,
       name: true,
@@ -89,6 +73,7 @@ export async function reconcileComments(): Promise<void> {
   const tokenCache = new Map<string, string | null>();
 
   for (const automation of automations) {
+    if (!isOwnedInstagramAccount(automation.instagramAccount.instagramId)) continue;
     const stat = await sweepCampaign(automation, sinceMs, tokenCache).catch(
       (error): SweepStat => ({
         campaign: automation.name,
@@ -165,9 +150,8 @@ async function sweepCampaign(
   }
   if (mediaIds.length === 0) return stat;
 
-  const queue = getDMQueue();
-
   for (const mediaId of mediaIds) {
+    if (stat.enqueued >= MAX_NEW_PER_SWEEP) break;
     let comments: InstagramComment[];
     try {
       comments = await getRecentMediaComments(accessToken, mediaId, sinceMs);
@@ -177,7 +161,7 @@ async function sweepCampaign(
     }
 
     // Keep only comments that (a) aren't the account's own, (b) match the
-    // keyword, and (c) have no reply from the account owner yet.
+    // keyword. Owner replies are recorded separately from DM eligibility.
     const needsAction = comments.filter((c) => {
       const authorId = c.from?.id;
       if (!authorId || authorId === account.instagramId) return false;
@@ -194,43 +178,32 @@ async function sweepCampaign(
       );
       if (ownerReplied) {
         stat.alreadyReplied += 1;
-        return false;
       }
       return true;
     });
     if (needsAction.length === 0) continue;
 
-    // Second guard against races: skip comments this campaign has already fully
-    // handled. "Fully handled" depends on the campaign: if it posts a public
-    // reply, the completion signal is publicReplySentAt (a DM alone is not
-    // enough — the reply still has to land); otherwise a SENT DM is enough. This
-    // is what lets a comment whose DM sent but whose public reply failed come
-    // back and retry the reply.
-    const handled = await prisma.dmLog.findMany({
-      where: {
-        automationId: automation.id,
-        commentId: { in: needsAction.map((c) => c.id) },
-        ...(automation.publicReplyEnabled
-          ? { publicReplySentAt: { not: null } }
-          : { status: "SENT" }),
-      },
-      select: { commentId: true },
+    // Public replies and DMs are independent. An existing public reply must
+    // not suppress a missing DM; ambiguous/rejected deliveries never retry.
+    const logs = await prisma.dmLog.findMany({
+      where: { automationId: automation.id, commentId: { in: needsAction.map((c) => c.id) } },
+      select: { commentId: true, dmDeliveryState: true, publicReplyDeliveryState: true },
     });
-    const handledSet = new Set(handled.map((h) => h.commentId));
+    const handledSet = new Set(logs.filter((log) =>
+      log.dmDeliveryState !== "PENDING" &&
+      (!automation.publicReplyEnabled || log.publicReplyDeliveryState !== "PENDING")
+    ).map((log) => log.commentId));
 
     // Oldest first, so whoever commented earliest gets answered first, capped.
     const fresh = needsAction
       .filter((c) => !handledSet.has(c.id))
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
-      .slice(0, MAX_NEW_PER_SWEEP);
+      .slice(0, MAX_NEW_PER_SWEEP - stat.enqueued);
 
     for (const c of fresh) {
-      // No deterministic jobId here: a retained completed/failed job from an
-      // earlier sweep would otherwise be treated as a duplicate and silently
-      // drop this add, so the comment would never be retried. Dedup is handled
-      // above (owner-reply + DmLog guards) and the worker is idempotent
-      // (publicReplySentAt / SENT), so re-processing a comment is safe.
-      await queue.add("process-comment", {
+      // A bounded time bucket collapses concurrent sweep instances while
+      // allowing a future sweep after an older completed outbox row.
+      await enqueueDurably("process-comment", {
         instagramAccountId: account.instagramId,
         commentId: c.id,
         commentText: c.text ?? "",
@@ -238,7 +211,8 @@ async function sweepCampaign(
         commenterName: c.from?.username,
         mediaId,
         source: "POLLING",
-      });
+        ownerHasReplied: (c.replies?.data ?? []).some((r) => r.from?.id === account.instagramId),
+      }, `poll:${automation.id}:${c.id}:${Math.floor(Date.now() / 300_000)}`);
       stat.enqueued += 1;
     }
   }

@@ -6,6 +6,7 @@ import {
   sendDirectMessage,
   MetaApiError,
 } from "@/lib/meta/client";
+import { isFeastPilot } from "@/lib/queue/send-policy";
 import { decryptToken } from "@/lib/meta/oauth";
 
 export interface ConversationListItem {
@@ -95,6 +96,9 @@ export async function GET(request: NextRequest) {
 
 // Send a direct message reply.
 export async function POST(request: NextRequest) {
+  if (isFeastPilot()) {
+    return NextResponse.json({ success: false, error: "Manual messaging is unavailable in the Feast internal pilot." }, { status: 403 });
+  }
   const workspaceId = await getCurrentWorkspaceId();
   if (!workspaceId) {
     return NextResponse.json(

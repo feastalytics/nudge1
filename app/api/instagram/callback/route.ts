@@ -10,6 +10,7 @@ import {
   verifyOAuthState,
 } from "@/lib/meta/oauth";
 import { canManageWorkspace } from "@/lib/workspace-access";
+import { FEAST_WORKSPACE_ID, isFeastMode, isFeastOwnedInstagramId } from "@/lib/feast/config";
 
 export async function GET(request: NextRequest) {
   const code = request.nextUrl.searchParams.get("code");
@@ -23,6 +24,10 @@ export async function GET(request: NextRequest) {
 
   if (!code || !state) {
     return NextResponse.redirect(`${baseUrl}/settings?instagram=invalid`);
+  }
+
+  if (isFeastMode() && state.workspaceId !== FEAST_WORKSPACE_ID) {
+    return NextResponse.redirect(`${baseUrl}/settings?instagram=forbidden`);
   }
 
   const session = await auth();
@@ -55,6 +60,9 @@ export async function GET(request: NextRequest) {
     // can be matched back to this account. Fall back to id if user_id is
     // ever absent.
     const instagramId = userInfo.user_id ?? userInfo.id;
+    if (!isFeastOwnedInstagramId(instagramId)) {
+      return NextResponse.redirect(`${baseUrl}/settings?instagram=forbidden`);
+    }
     const connection = await canConnectInstagramAccount({
       workspaceId: state.workspaceId,
       instagramId,

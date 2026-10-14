@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/db/client";
+import { isFeastMode } from "@/lib/feast/config";
 import {
   buildInvitationUrl,
   generateInvitationToken,
@@ -48,7 +49,7 @@ async function getMemberPayload(
         },
       },
     }),
-    prisma.workspaceInvitation.findMany({
+    isFeastMode() ? Promise.resolve([]) : prisma.workspaceInvitation.findMany({
       where: { workspaceId, status: "PENDING" },
       orderBy: { createdAt: "desc" },
       select: {
@@ -63,6 +64,7 @@ async function getMemberPayload(
   ]);
 
   return {
+    managedByFeast: isFeastMode(),
     ...(currentUserRole ? { currentUserRole } : {}),
     members,
     invitations: invitations.map((invitation) => ({
@@ -90,6 +92,7 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
+  if (isFeastMode()) return NextResponse.json({ error: "Staff access is managed in Feast Admin." }, { status: 403 });
   const context = await getCurrentWorkspaceContext();
   if (!context) {
     return NextResponse.json(
@@ -169,6 +172,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function PATCH(request: NextRequest) {
+  if (isFeastMode()) return NextResponse.json({ error: "Staff access is managed in Feast Admin." }, { status: 403 });
   const context = await getCurrentWorkspaceContext();
   if (!context) {
     return NextResponse.json(
@@ -213,6 +217,7 @@ export async function PATCH(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
+  if (isFeastMode()) return NextResponse.json({ error: "Staff access is managed in Feast Admin." }, { status: 403 });
   const context = await getCurrentWorkspaceContext();
   if (!context) {
     return NextResponse.json(

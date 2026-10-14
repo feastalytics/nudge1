@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 import InvitationAcceptCard from "@/components/invitation-accept-card";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
+import { isFeastMode } from "@/lib/feast/config";
 
 type InvitePageProps = {
   params: Promise<{ token: string }>;
@@ -15,6 +16,7 @@ export const metadata: Metadata = {
 };
 
 export default async function InvitePage({ params }: InvitePageProps) {
+  if (isFeastMode()) notFound();
   const { token } = await params;
   const [session, invitation] = await Promise.all([
     auth(),

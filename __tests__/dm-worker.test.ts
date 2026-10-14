@@ -87,6 +87,8 @@ vi.mock("@/lib/ops/worker-health", () => ({
   recordWorkerAlert: vi.fn(),
 }));
 
+vi.mock("@/lib/queue/outbox", () => ({ enqueueDurably: mockQueueAdd }));
+
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({
     add: mockQueueAdd,
@@ -173,12 +175,16 @@ function createMockJob(data = mockJobData) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.stubEnv("FEAST_MODE", "false");
+  vi.stubEnv("FEAST_SSO_SECRET", undefined);
+  vi.stubEnv("FEAST_ADMIN_ORIGIN", "");
+  vi.stubEnv("FEAST_SEND_ENABLED", "true");
 
   mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
   mockPrisma.dmLog.findFirst.mockResolvedValue(null);
   mockPrisma.dmLog.create.mockResolvedValue({});
-  mockPrisma.dmLog.upsert.mockResolvedValue({});
+  mockPrisma.dmLog.upsert.mockResolvedValue({ dmDeliveryState: "PENDING" });
   mockPrisma.dmLog.update.mockResolvedValue({});
   mockPrisma.dmLog.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.instagramAccount.findUnique.mockResolvedValue({
@@ -282,9 +288,10 @@ describe("DM Worker — Full Pipeline", () => {
   });
 
   it("should skip duplicate comments already sent", async () => {
-    mockPrisma.dmLog.findUnique.mockResolvedValue({
+    mockPrisma.dmLog.upsert.mockResolvedValue({
       id: "existing_log",
       status: "SENT",
+      dmDeliveryState: "SENT",
     });
     const processor = getProcessor();
 
@@ -319,10 +326,8 @@ describe("DM Worker — Full Pipeline", () => {
         commentId: "comment_555",
         requeueAttempt: 1,
       }),
-      expect.objectContaining({
-        delay: 1800000,
-        jobId: "comment_ig_456_comment_555_retry_1",
-      })
+      "comment:ig_456:comment_555:retry:1",
+      1800000
     );
   });
 
@@ -352,17 +357,14 @@ describe("DM Worker — Full Pipeline", () => {
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
   });
 
-  it("should log FAILED, release usage, and re-throw when private reply sending fails", async () => {
+  it("quarantines an ambiguous send failure and retains uncertain usage", async () => {
     const error = new Error("API Error");
     mockSendPrivateReply.mockRejectedValue(error);
 
     const processor = getProcessor();
 
-    await expect(processor(createMockJob())).rejects.toThrow("API Error");
-    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
-      "workspace_123",
-      usagePeriodStart
-    );
+    await processor(createMockJob());
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
       where: {
         automationId_commentId: {
@@ -372,7 +374,8 @@ describe("DM Worker — Full Pipeline", () => {
       },
       data: expect.objectContaining({
         status: "FAILED",
-        errorMessage: "API Error",
+        errorMessage: expect.stringContaining("UNKNOWN: API Error"),
+        dmDeliveryState: "UNKNOWN",
       }),
     });
   });
@@ -391,13 +394,8 @@ describe("DM Worker — Full Pipeline", () => {
     const processor = getProcessor();
     await processor(createMockJob());
 
-    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        create: expect.objectContaining({
-          status: "FAILED",
-          errorMessage: "No Instagram access token available",
-        }),
-      })
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", errorMessage: "No Instagram access token available" }) })
     );
     expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
     expect(mockSendPrivateReply).not.toHaveBeenCalled();

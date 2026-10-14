@@ -1,5 +1,10 @@
+import { assertSendAllowed } from "@/lib/queue/send-policy";
 import { getMetaGraphApiVersion, requireEnv } from "@/lib/env";
 import { DEFAULT_UTC_OFFSET_MINUTES, formatDateKey } from "@/lib/utils/timezone";
+
+function metaFetch(url: string | URL, options?: RequestInit): Promise<Response> {
+  return fetch(url, { ...options, signal: options?.signal ?? AbortSignal.timeout(15_000) });
+}
 
 function instagramGraphBase() {
   return `https://graph.instagram.com/${getMetaGraphApiVersion()}`;
@@ -94,6 +99,11 @@ interface TokenResponse {
 }
 
 async function handleResponse<T>(response: Response): Promise<T> {
+  if (response.status >= 500) {
+    // A server error can occur after Meta accepted a message. Never infer
+    // non-delivery from it or automatically fall back to another message.
+    throw new Error("UNKNOWN: Meta server error; delivery requires reconciliation");
+  }
   const data = await response.json();
 
   if (!response.ok || (data as GraphApiError).error) {
@@ -128,10 +138,12 @@ export async function sendPrivateReply(
   commentId: string,
   message: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -143,7 +155,9 @@ export async function sendPrivateReply(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -160,10 +174,12 @@ export async function sendPrivateReplyWithButton(
   buttonTitle: string,
   payload: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -187,7 +203,9 @@ export async function sendPrivateReplyWithButton(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -203,10 +221,12 @@ export async function sendPrivateReplyWithLinkButton(
   buttonTitle: string,
   url: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -227,7 +247,9 @@ export async function sendPrivateReplyWithLinkButton(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -240,10 +262,12 @@ export async function sendDirectMessage(
   userId: string,
   message: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -255,7 +279,9 @@ export async function sendDirectMessage(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -272,10 +298,12 @@ export async function sendDirectMessageWithButton(
   buttonTitle: string,
   payload: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -298,7 +326,9 @@ export async function sendDirectMessageWithButton(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -313,10 +343,12 @@ export async function sendDirectMessageWithLinkButton(
   buttonTitle: string,
   url: string
 ): Promise<{ recipient_id: string; message_id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/messages`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -337,18 +369,23 @@ export async function sendDirectMessageWithLinkButton(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ recipient_id: string; message_id: string }>(response);
+  if (!result.message_id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 export async function sendCommentReply(
   accessToken: string,
   commentId: string,
-  message: string
+  message: string,
+  instagramAccountId?: string
 ): Promise<{ id: string }> {
-  const response = await fetch(
+  assertSendAllowed(instagramAccountId);
+  const response = await metaFetch(
     `${instagramGraphBase()}/${commentId}/replies`,
     {
       method: "POST",
+      signal: AbortSignal.timeout(15_000),
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${accessToken}`,
@@ -357,7 +394,9 @@ export async function sendCommentReply(
     }
   );
 
-  return handleResponse(response);
+  const result = await handleResponse<{ id: string }>(response);
+  if (!result.id) throw new Error("UNKNOWN: Meta omitted message ID; delivery requires reconciliation");
+  return result;
 }
 
 /**
@@ -388,7 +427,7 @@ export async function getRecentMediaComments(
   let nextUrl: string | null = first.toString();
 
   while (nextUrl !== null && results.length < max) {
-    const response: Response = await fetch(nextUrl);
+    const response: Response = await metaFetch(nextUrl);
     const page = await handleResponse<{
       data: InstagramComment[];
       paging?: { next?: string };
@@ -448,7 +487,7 @@ export async function getConversations(
   url.searchParams.set("limit", "50");
   url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<{ data: InstagramConversation[] }>(response);
   return data.data ?? [];
 }
@@ -465,7 +504,7 @@ export async function getConversationMessages(
   url.searchParams.set("fields", "messages{id,created_time,from,to,message}");
   url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<{ messages?: { data: InstagramMessage[] } }>(
     response
   );
@@ -480,7 +519,7 @@ export async function getUserInfo(accessToken: string): Promise<InstagramUser> {
   );
   url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   return handleResponse<InstagramUser>(response);
 }
 
@@ -511,7 +550,7 @@ export async function getFollowerGrowth(
   url.searchParams.set("until", String(until));
   url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<{
     data: Array<{
       name: string;
@@ -541,7 +580,7 @@ export async function getUserMedia(
   url.searchParams.set("limit", limit.toString());
   url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<{ data: InstagramMedia[] }>(response);
   return data.data;
 }
@@ -566,7 +605,7 @@ export async function getAllUserMedia(
   let nextUrl: string | null = first.toString();
 
   while (nextUrl !== null && results.length < max) {
-    const response: Response = await fetch(nextUrl);
+    const response: Response = await metaFetch(nextUrl);
     const page = await handleResponse<{
       data: InstagramMedia[];
       paging?: { next?: string };
@@ -586,7 +625,7 @@ export async function getLongLivedToken(
   url.searchParams.set("client_secret", requireEnv("INSTAGRAM_APP_SECRET"));
   url.searchParams.set("access_token", shortLivedToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<TokenResponse>(response);
 
   return {
@@ -602,7 +641,7 @@ export async function refreshLongLivedToken(
   url.searchParams.set("grant_type", "ig_refresh_token");
   url.searchParams.set("access_token", longLivedToken);
 
-  const response = await fetch(url.toString());
+  const response = await metaFetch(url.toString());
   const data = await handleResponse<TokenResponse>(response);
 
   return {
@@ -615,7 +654,7 @@ export async function subscribeInstagramAccountToWebhooks(
   instagramAccountId: string,
   accessToken: string
 ): Promise<{ success: boolean }> {
-  const response = await fetch(
+  const response = await metaFetch(
     `${instagramGraphBase()}/${instagramAccountId}/subscribed_apps`,
     {
       method: "POST",
@@ -624,7 +663,7 @@ export async function subscribeInstagramAccountToWebhooks(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({
-        subscribed_fields: ["comments", "messages"],
+        subscribed_fields: ["comments", "messages", "messaging_postbacks"],
       }),
     }
   );

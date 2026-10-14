@@ -2,6 +2,7 @@ import type { Workspace, WorkspaceRole } from "@/app/generated/prisma/client";
 import { getCurrentUserId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { ensureWorkspaceForUser } from "@/lib/workspace";
+import { FEAST_WORKSPACE_ID, isFeastMode } from "@/lib/feast/config";
 
 export type WorkspaceContext = {
   userId: string;
@@ -36,7 +37,7 @@ export async function getCurrentWorkspaceContext(): Promise<WorkspaceContext | n
   if (!userId) return null;
 
   const membership = await prisma.workspaceMember.findFirst({
-    where: { userId },
+    where: { userId, ...(isFeastMode() ? { workspaceId: FEAST_WORKSPACE_ID, role: { in: ["OWNER", "ADMIN"] as WorkspaceRole[] } } : {}) },
     include: { workspace: true },
     orderBy: { createdAt: "asc" },
   });
@@ -49,6 +50,8 @@ export async function getCurrentWorkspaceContext(): Promise<WorkspaceContext | n
       role: membership.role,
     };
   }
+
+  if (isFeastMode()) return null;
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
